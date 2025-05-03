@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>YOLOv5 物件偵測系統</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&family=Poppins:wght@300;400;500&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #f7f7f7;
+            color: #333;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        header {
+            background-color: #4CAF50;
+            width: 100%;
+            padding: 10px 0;
+            text-align: center;
+            color: white;
+            font-size: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        #alert-box {
+            display: none;
+            background-color: #f44336;
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            width: 90%;
+            max-width: 600px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+        .tag {
+            display: inline-block;
+            margin: 5px;
+            padding: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border-radius: 5px;
+            font-weight: 500;
+        }
+        #video-container {
+            width: 90%;
+            max-width: 800px;
+            margin-top: 30px;
+            text-align: center;
+            display: flex;
+            justify-content: space-around;
+            gap: 20px;
+        }
+        .video-frame {
+            width: 45%;
+            border: 2px solid #ccc;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        .video-section {
+            margin-bottom: 40px;
+        }
+        footer {
+            background-color: #333;
+            color: white;
+            width: 100%;
+            padding: 10px 0;
+            text-align: center;
+            margin-top: 40px;
+        }
+        h2 {
+            font-family: 'Poppins', sans-serif;
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>YOLOv5 物件偵測系統</h1>
+    </header>
+
+    <div style="margin-top: 15px;">
+        <label for="mode-select">選擇模式：</label>
+        <select id="mode-select">
+            <option value="object">物件偵測</option>
+            <option value="face">人臉辨識</option>
+        </select>
+    </div>
+
+    <div id="alert-box">
+        <strong>警告！</strong> 偵測到重要物件！
+    </div>
+
+    <div id="video-container">
+        <div class="video-section">
+            <h2>原始視頻流</h2>
+            <img id="raw-video" class="video-frame" src="" alt="原始視頻流加載中..." />
+        </div>
+
+        <div class="video-section">
+            <h2>處理後視頻流</h2>
+            <img id="processed-video" class="video-frame" src="" alt="處理後視頻流加載中..." />
+        </div>
+    </div>
+
+    <div>
+        <h3 id="object-label">目前偵測到的物件：</h3>
+        <div id="object-list">載入中...</div>
+    </div>
+
+    <footer>
+        <p>&copy; 2025 YOLOv5 物件偵測系統</p>
+    </footer>
+
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+        const alertBox = document.getElementById('alert-box');
+        const objectListDiv = document.getElementById("object-list");
+        const objectLabel = document.getElementById("object-label");
+        const rawVideo = document.getElementById("raw-video");
+        const processedVideo = document.getElementById("processed-video");
+        const alertSound = new Audio('alert.mp3');
+        let currentMode = "object";
+
+        document.getElementById("mode-select").addEventListener("change", function () {
+            currentMode = this.value;
+            updateDisplayMode();
+        });
+
+        function updateDisplayMode() {
+            objectListDiv.innerHTML = "模式切換中...";
+            rawVideo.src = "";
+            processedVideo.src = "";
+
+            if (currentMode === "object") {
+                objectLabel.innerText = "目前偵測到的物件：";
+                socket.emit('switch_mode', { mode: 'object' });
+            } else {
+                objectLabel.innerText = "人臉辨識結果：";
+                socket.emit('switch_mode', { mode: 'face' });
+            }
+        }
+
+        socket.on('video_frame', (data) => {
+            rawVideo.src = 'data:image/jpeg;base64,' + data.raw_frame;
+            processedVideo.src = 'data:image/jpeg;base64,' + data.processed_frame;
+        });
+
+        socket.on('update_labels', (data) => {
+            objectListDiv.innerHTML = data.labels.length === 0 ? "尚未偵測到任何物件" : "";
+            data.labels.forEach(obj => {
+                const tag = document.createElement("div");
+                tag.className = "tag";
+                tag.textContent = obj;
+                objectListDiv.appendChild(tag);
+            });
+        });
+
+        socket.on('play_alert_sound', (data) => {
+            if (data.play_sound) {
+                alertBox.style.display = 'block';
+                alertSound.play();
+            } else {
+                alertBox.style.display = 'none';
+            }
+        });
+
+        socket.on('face_analysis', (data) => {
+            if (currentMode === "face") {
+                objectListDiv.innerHTML = "";
+                data.faces.forEach((face, i) => {
+                    const div = document.createElement("div");
+                    div.className = "tag";
+                    div.innerText = `臉${i + 1}：${face.gender}, ${face.age}歲, 情緒：${face.emotion}`;
+                    objectListDiv.appendChild(div);
+                });
+            }
+        });
+
+        updateDisplayMode();
+    </script>
+</body>
+</html>
