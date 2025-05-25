@@ -1,147 +1,153 @@
+from flask import Flask, render_template, Response, request, jsonify
+import os
 import cv2
-import time
-from flask import Flask, render_template
-from flask_socketio import SocketIO
-from deepface import DeepFace
+import numpy as np
+from ultralytics import YOLO
 import threading
-import base64
-import torch
+import time
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.config['UPLOAD_FOLDER'] = 'static/output_results'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# 載入 YOLOv5 模型
-model = torch.hub.load('yolov5', 'yolov5s', source='local', pretrained=True)
-model.conf = 0.5
+# 初始模型與鎖
+model_type = 'detect'
+model = YOLO('yolo11s.pt')
+model_lock = threading.Lock()
 
-frame_queue = []
-frame_lock = threading.Lock()
-current_mode = "object"
-last_face_analysis_time = 0  # 控制人臉分析頻率
+# --------- Helper Functions ---------
+def draw_bounding_boxes(image, results):
+    boxes = results[0].boxes
+    names = results[0].names or {}  # 安全取得類別名稱
 
+    for box in boxes:
+        xyxy = box.xyxy[0].cpu().numpy()
+        conf = box.conf[0].cpu().item()
+        cls_id = int(box.cls[0].cpu().item())
+
+        x1, y1, x2, y2 = map(int, xyxy)
+        label = f"{names.get(cls_id, cls_id)} {conf:.2f}"
+
+        # 畫框
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # 畫標籤背景
+        cv2.rectangle(image, (x1, y1 - 25), (x1 + len(label) * 12, y1), (0, 255, 0), -1)
+        # 畫文字
+        cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
+
+    return image
+
+def get_model_choices():
+    return [
+        ('detect', 'Object Detection'),
+        ('segment', 'Instance Segmentation'),
+        ('classify', 'Image Classification'),
+        ('pose', 'Pose Estimation')
+    ]
+
+# --------- Real-time Video Feed ---------
+def gen_frames():
+    cap = cv2.VideoCapture(0)
+    prev_time = 0
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if prev_time else 0
+        prev_time = current_time
+
+        with model_lock:
+            current_model = model
+            current_task = model_type
+
+        results = current_model(frame, task=current_task)
+
+        if current_task == 'detect':
+            frame = draw_bounding_boxes(frame, results)
+        elif current_task in ['segment', 'pose']:
+            frame = results[0].plot()
+        elif current_task == 'classify':
+            names = results[0].names
+            probs = getattr(results[0], 'probs', None)
+            if probs is not None:
+                probs = probs.data.cpu().numpy()
+                y = 30
+                for i, prob in enumerate(probs):
+                    if prob > 0.01:
+                        label = f"{names[i]}: {prob:.2f}"
+                        cv2.putText(frame, label, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                        y += 30
+            else:
+                cv2.putText(frame, "No classification results", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # 顯示 FPS
+        cv2.putText(frame, f"FPS: {fps:.2f}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+
+# --------- Routes ---------
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html', models=get_model_choices(), current_model=model_type)
 
-def video_capture():
-    camera = cv2.VideoCapture(0)
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    while True:
-        success, frame = camera.read()
-        if success:
-            with frame_lock:
-                if len(frame_queue) > 10:
-                    frame_queue.pop(0)
-                frame_queue.append(frame)
-        time.sleep(1 / 30)
+@app.route('/switch_model', methods=['POST'])
+def switch_model():
+    global model, model_type
+    new_type = request.form.get('model_type')
+    with model_lock:
+        model_type = new_type
+        if new_type == 'detect':
+            model = YOLO('yolo11s.pt')
+        elif new_type == 'segment':
+            model = YOLO('yolo11s-seg.pt')
+        elif new_type == 'classify':
+            model = YOLO('yolo11s-cls.pt')
+        elif new_type == 'pose':
+            model = YOLO('yolo11s-pose.pt')
+    return jsonify({'message': f'Model switched to {new_type}'})
 
-def object_detection():
-    while True:
-        if current_mode == "object":
-            with frame_lock:
-                if frame_queue:
-                    raw_frame = frame_queue[-1].copy()
-                else:
-                    time.sleep(1 / 30)
-                    continue
+@app.route('/process_image', methods=['POST'])
+def process_image():
+    image = request.files['image']
+    img = cv2.imdecode(np.frombuffer(image.read(), np.uint8), cv2.IMREAD_COLOR)
+    with model_lock:
+        current_model = model
+        current_task = model_type
+    results = current_model(img, task=current_task)
 
-            frame = raw_frame.copy()
-            results = model(frame)
-            detected_objects = []
+    if current_task == 'detect':
+        img = draw_bounding_boxes(img, results)
+    elif current_task in ['segment', 'pose']:
+        img = results[0].plot()
+    elif current_task == 'classify':
+        names = results[0].names
+        probs = getattr(results[0], 'probs', None)
+        if probs is not None:
+            probs = probs.data.cpu().numpy()
+            y = 30
+            for i, prob in enumerate(probs):
+                if prob > 0.01:
+                    label = f"{names[i]}: {prob:.2f}"
+                    cv2.putText(img, label, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                    y += 30
 
-            for *xyxy, conf, cls in results.xyxy[0]:
-                x1, y1, x2, y2 = map(int, xyxy)
-                label = model.names[int(cls)]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                detected_objects.append(label)
+    result_path = os.path.join(app.config['UPLOAD_FOLDER'], 'processed_image.jpg')
+    cv2.imwrite(result_path, img)
+    return jsonify(result=result_path)
 
-            _, raw_buffer = cv2.imencode('.jpg', raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-            _, processed_buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-
-            socketio.emit('video_frame', {
-                'raw_frame': base64.b64encode(raw_buffer).decode('utf-8'),
-                'processed_frame': base64.b64encode(processed_buffer).decode('utf-8'),
-            })
-
-            socketio.emit('update_labels', {'labels': detected_objects})
-            socketio.emit('play_alert_sound', {'play_sound': 'person' in detected_objects})
-        else:
-            time.sleep(0.5)
-        time.sleep(1 / 30)
-
-def face_detection():
-    global last_face_analysis_time
-    while True:
-        if current_mode == "face":
-            now = time.time()
-            if now - last_face_analysis_time >= 1:#調整人臉辨識速度
-                with frame_lock:
-                    if frame_queue:
-                        frame = frame_queue[-1].copy()
-                    else:
-                        time.sleep(1 / 30)
-                        continue
-                try:
-                    result = DeepFace.analyze(
-                        frame,
-                        actions=['gender', 'age', 'emotion'],
-                        enforce_detection=False
-                    )
-
-                    faces_info = []
-                    for face in result:
-                        faces_info.append({
-                            'gender': face['dominant_gender'],
-                            'age': face['age'],
-                            'emotion': face['dominant_emotion']
-                        })
-
-                    # 傳送分析結果
-                    socketio.emit('face_analysis', {'faces': faces_info})
-
-                    # 顯示人臉框 + 顯示影像畫面（處理後）
-                    processed_frame = frame.copy()
-                    for face in result:
-                        region = face['region']
-                        x, y, w, h = region['x'], region['y'], region['w'], region['h']
-                        cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-
-                    _, raw_buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                    _, processed_buffer = cv2.imencode('.jpg', processed_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-
-                    socketio.emit('video_frame', {
-                        'raw_frame': base64.b64encode(raw_buffer).decode('utf-8'),
-                        'processed_frame': base64.b64encode(processed_buffer).decode('utf-8'),
-                    })
-
-                    last_face_analysis_time = now
-                except Exception as e:
-                    print("Face detection error:", e)
-        else:
-            time.sleep(0.5)
-        time.sleep(1 / 30)
-
-
-@socketio.on('switch_mode')
-def handle_switch_mode(data):
-    global current_mode
-    new_mode = data['mode']
-    if new_mode != current_mode:
-        print(f"[後端] 模式切換中：{current_mode} ➜ {new_mode}")
-        with frame_lock:
-            frame_queue.clear()  # 清空 queue 避免切換時用到舊資料
-        current_mode = new_mode
-        time.sleep(0.3)  # 小延遲避免 race condition
-    print(f"[後端] 已切換到 {current_mode} 模式")
+@app.route('/saved_results')
+def saved_results():
+    files = os.listdir(app.config['UPLOAD_FOLDER'])
+    return jsonify({'results': files})
 
 if __name__ == '__main__':
-    threading.Thread(target=video_capture, daemon=True).start()
-    threading.Thread(target=object_detection, daemon=True).start()
-    threading.Thread(target=face_detection, daemon=True).start()
-
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True)
